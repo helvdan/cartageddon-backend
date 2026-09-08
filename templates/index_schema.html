@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>ETL Parquet Viewer</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --panel-bg: #1e293b;
+            --text-color: #f8fafc;
+            --accent-color: #38bdf8;
+            --node-bg: #334155;
+            --node-active: #0284c7;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Верхняя панель со схемой ETL */
+        #pipeline-container {
+            background-color: var(--panel-bg);
+            padding: 20px 40px; /* 40px по бокам создадут идеальный симметричный зазор */
+            border-bottom: 2px solid #475569;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow-x: auto;
+        }
+
+        svg {
+            background: #111827;
+            border-radius: 8px;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.6);
+            display: block;
+        }
+
+        /* Стили для интерактивных элементов схемы */
+        .etl-node {
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .etl-node rect {
+            fill: var(--node-bg);
+            stroke: #475569;
+            stroke-width: 2;
+            transition: fill 0.3s, stroke 0.3s;
+        }
+        .etl-node text {
+            fill: #e2e8f0;
+            font-size: 13px;
+            font-weight: 500;
+            user-select: none;
+        }
+        /* Подсветка при наведении */
+        .etl-node:hover rect {
+            fill: #475569;
+            stroke: var(--accent-color);
+        }
+        /* Подсветка активной стадии */
+        .etl-node.active rect {
+            fill: var(--node-active);
+            stroke: var(--accent-color);
+        }
+        .arrow {
+            fill: #475569;
+        }
+
+        /* Основная рабочая область */
+        #main-content {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Левое меню файлов */
+        #sidebar {
+            width: 300px;
+            background-color: var(--panel-bg);
+            border-right: 2px solid #475569;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+        #sidebar-title {
+            padding: 15px;
+            font-size: 16px;
+            font-weight: bold;
+            border-bottom: 1px solid #475569;
+            background: #1e293b;
+            position: sticky;
+            top: 0;
+        }
+        .file-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .file-item {
+            padding: 12px 20px;
+            border-bottom: 1px solid #334155;
+            cursor: pointer;
+            transition: background 0.2s;
+            font-size: 14px;
+            word-break: break-all;
+        }
+        .file-item:hover {
+            background-color: #334155;
+            color: var(--accent-color);
+        }
+
+        /* Область просмотра таблицы данных */
+        #viewer {
+            flex: 1;
+            padding: 20px;
+            overflow: auto;
+            background-color: var(--bg-color);
+        }
+        .placeholder {
+            color: #64748b;
+            text-align: center;
+            margin-top: 100px;
+            font-size: 16px;
+        }
+        .file-item.active {
+            background-color: #0284c7 !important; /* Насыщенный синий цвет, как у активной стадии */
+            color: #ffffff !important;
+            font-weight: bold;
+            border-left: 4px solid var(--accent-color); /* Красивая полоска слева */
+            padding-left: 16px; /* Небольшое смещение из-за полоски */
+        }
+
+        /* Наведение на цилиндр */
+        .etl-node:hover path,
+        .etl-node:hover ellipse {
+            stroke: var(--accent-color) !important;
+        }
+
+        /* Состояние, когда цилиндр выбран */
+        .etl-node.active path,
+        .etl-node.active ellipse {
+            fill: var(--node-active) !important;
+            stroke: var(--accent-color) !important;
+        }
+    </style>
+    <link href="{{ url_for('static', path='styles_schema.css') }}" rel="stylesheet">
+</head>
+<body>
+
+    <!-- ВЕРХНЯЯ ПАНЕЛЬ: Вытянутая схема в один ряд, легенда вырезана -->
+    <div id="pipeline-container">
+        <svg id="etl-pipeline" width="1190" height="150">
+            <!-- Иконка Базы Данных (Цилиндр в стиле Draw.io) -->
+            <g id="node-source-db" class="etl-node" onclick="filterStage('source-db')">
+                <!-- Тело цилиндра (стандартная серая обводка #475569) -->
+                <path d="M 30,50 L 30,90 A 30,12 0 0 0 90,90 L 90,50" fill="#334155" stroke="#475569" stroke-width="2"/>
+                <!-- Верхняя крышка цилиндра -->
+                <ellipse cx="60" cy="50" rx="30" ry="12" fill="#334155" stroke="#475569" stroke-width="2"/>
+                <!-- Текст, центрированный по вертикали и горизонтали фигуры (Y=75) -->
+                <text x="60" y="80" text-anchor="middle" fill="#e2e8f0" font-size="13" font-weight="500" user-select="none">MySQL</text>
+            </g>
+            <!-- Стрелка от БД к extracted -->
+            <polygon points="110,65 120,70 110,75" class="arrow"/>
+
+            <!-- Стадия 1: extracted (Сдвинута на X=130) -->
+            <g id="node-extracted" class="etl-node" onclick="filterStage('extracted')">
+                <rect x="130" y="45" width="130" height="50" rx="6"/>
+                <text x="195" y="75" text-anchor="middle">extracted</text>
+            </g>
+            <polygon points="270,65 280,70 270,75" class="arrow"/>
+
+            <!-- Стадия 2: normalized (Сдвинута на X=290) -->
+            <g id="node-normalized" class="etl-node" onclick="filterStage('normalized')">
+                <rect x="290" y="45" width="130" height="50" rx="6"/>
+                <text x="355" y="75" text-anchor="middle">normalized</text>
+            </g>
+            <polygon points="430,65 440,70 430,75" class="arrow"/>
+
+            <!-- Стадия 3: deduplicated (Сдвинута на X=450) -->
+            <g id="node-deduplicated" class="etl-node" onclick="filterStage('deduplicated')">
+                <rect x="450" y="45" width="130" height="50" rx="6"/>
+                <text x="515" y="75" text-anchor="middle">deduplicated</text>
+            </g>
+            <polygon points="590,65 600,70 590,75" class="arrow"/>
+
+            <!-- Стадия 4: checked (Сдвинута на X=610) -->
+            <g id="node-checked" class="etl-node" onclick="filterStage('checked')">
+                <rect x="610" y="45" width="130" height="50" rx="6"/>
+                <text x="675" y="75" text-anchor="middle">checked</text>
+            </g>
+            <polygon points="750,65 760,70 750,75" class="arrow"/>
+
+            <!-- Стадия 5: joined (Сдвинута на X=770) -->
+            <g id="node-joined" class="etl-node" onclick="filterStage('joined')">
+                <rect x="770" y="45" width="130" height="50" rx="6"/>
+                <text x="835" y="75" text-anchor="middle">joined</text>
+            </g>
+
+            <!-- РАЗВЕТВЛЕНИЕ: Линии выходят из ровного центра обновленного блока joined (X=900, Y=70) -->
+            <!-- Стрелка вверх к loading_db -->
+            <path d="M 900,70 L 915,35 L 925,35" fill="none" stroke="#334155" stroke-width="2"/>
+            <polygon points="923,31 930,35 923,39" fill="#334155"/>
+
+            <!-- Стрелка вниз к loading_s3 -->
+            <path d="M 900,70 L 915,105 L 925,105" fill="none" stroke="#334155" stroke-width="2"/>
+            <polygon points="923,101 930,105 923,109" fill="#334155"/>
+
+            <!-- ================= ВЕРХНЯЯ ВЕТКА (DATABASE) ================= -->
+            <!-- Стадия 7: loading_db (ПРЯМОУГОЛЬНИК, НЕКЛИКАБЕЛЬНЫЙ) -->
+            <g id="node-loading_db" style="cursor: not-allowed;">
+                <rect x="930" y="10" width="130" height="50" rx="6" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+                <text x="995" y="40" text-anchor="middle" fill="#64748b">loading_db</text>
+            </g>
+            <!-- Стрелка от loading_db к цилиндру Postgres -->
+            <polygon points="1070,30 1080,35 1070,40" fill="#334155"/>
+
+            <!-- Цилиндр Postgres (НЕКЛИКАБЕЛЬНЫЙ) -->
+            <g id="target-postgres" style="cursor: not-allowed;">
+                <path d="M 1090,15 L 1090,55 A 30,12 0 0 0 1150,55 L 1150,15" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+                <ellipse cx="1120" cy="15" rx="30" ry="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+                <text x="1120" y="40" text-anchor="middle" fill="#64748b" font-size="11" font-weight="bold" user-select="none">Postgres</text>
+            </g>
+
+            <!-- ================= НИЖНЯЯ ВЕТКА (S3 STORAGE) ================= -->
+            <!-- Стадия 6: loading_s3 (ПРЯМОУГОЛЬНИК, НЕКЛИКАБЕЛЬНЫЙ) -->
+            <g id="node-loading_s3" style="cursor: not-allowed;">
+                <rect x="930" y="90" width="130" height="50" rx="6" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+                <text x="995" y="120" text-anchor="middle" fill="#64748b">loading_s3</text>
+            </g>
+            <!-- Стрелка от loading_s3 к цилиндру MinIO -->
+            <polygon points="1070,110 1080,115 1070,120" fill="#334155"/>
+
+            <!-- Цилиндр MinIO S3 (КЛИКАБЕЛЬНЫЙ СО ССЫЛКОЙ) -->
+            <a href="http://0.0.0.0:9001/browser/dev/catalog" target="_blank" style="text-decoration: none;">
+                <g id="target-minio" class="etl-node" style="cursor: pointer;">
+                    <path d="M 1090,95 L 1090,135 A 30,12 0 0 0 1150,135 L 1150,95" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+                    <ellipse cx="1120" cy="95" rx="30" ry="12" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+                    <text x="1120" y="120" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="bold" user-select="none">MinIO S3</text>
+                </g>
+            </a>
+        </svg>
+    </div>
+
+    <!-- ОСНОВНОЙ БЛОК -->
+    <div id="main-content">
+        <!-- ЛЕВОЕ МЕНЮ ФАЙЛОВ -->
+        <div id="sidebar">
+            <div id="sidebar-title">Выберите стадию на схеме</div>
+            <ul id="file-list" class="file-list">
+                <!-- Файлы будут загружаться сюда через JS -->
+            </ul>
+        </div>
+
+        <!-- ПРОСМОТР ТАБЛИЦЫ -->
+        <div id="viewer">
+            <div class="placeholder">Выберите файл в левом меню для отображения данных</div>
+        </div>
+    </div>
+
+    <script>
+        // Глобальное хранилище данных структуры меню из FastAPI
+        let menuData = {};
+
+        document.addEventListener('keydown', function(event) {
+            // Находим на SVG-схеме выделенный элемент
+            const activeNode = document.querySelector('.etl-node.active');
+            if (!activeNode) return; // Если ничего не выбрано — игнорируем нажатия
+
+            const stageName = activeNode.id.replace('node-', '');
+
+            // --- КЛАВИША ENTER (Запуск пайплайна через PUT) ---
+            if (event.key === 'Enter') {
+                if (confirm(`Запустить конвейер ETL начиная со стадии "${stageName.toUpperCase()}"? Предыдущие шаги будут пропущены.`)) {
+
+                    // Визуально показываем пользователю загрузку, чтобы он видел, что бэкенд занят
+                    document.getElementById('sidebar-title').innerText = "⏳ Пайплайн выполняется...";
+
+                    fetch(`/stages/${stageName}/`, {
+                        method: 'PUT'
+                    })
+                    .then(response => {
+                        if (response.ok) {
+                            return response.json();
+                        } else {
+                            return response.json().then(err => { throw new Error(err.detail || 'Ошибка запуска пайплайна'); });
+                        }
+                    })
+                    .then(data => {
+                        alert(`Пайплайн успешно завершен!\nВыполненные стадии: ${data.executed_stages.join(', ')}`);
+                        window.location.reload(); // Обновляем страницу для загрузки новых файлов в меню
+                    })
+                    .catch(err => {
+                        alert(`Ошибка: ${err.message}`);
+                        window.location.reload();
+                    });
+                }
+            }
+
+            // --- КЛАВИША DELETE / BACKSPACE (Очистка файлов через DELETE) ---
+            if (event.key === 'Delete' || event.key === 'Backspace') {
+                if (confirm(`Вы уверены, что хотите очистить стадию "${stageName.toUpperCase()}" и удалить все её файлы?`)) {
+                    fetch(`/stages/${stageName}/`, {
+                        method: 'DELETE'
+                    })
+                    .then(response => {
+                        if (response.ok) {
+                            alert(`Стадия ${stageName} успешно очищена`);
+                            window.location.reload();
+                        } else {
+                            return response.json().then(err => { throw new Error(err.detail || 'Ошибка удаления'); });
+                        }
+                    })
+                    .catch(err => {
+                        alert(`Не удалось удалить файлы: ${err.message}`);
+                    });
+                }
+            }
+        });
+
+        // 1. При загрузке страницы скачиваем структуру меню с бэкенда
+        document.addEventListener("DOMContentLoaded", () => {
+            fetch('/menu')
+                .then(response => response.json())
+                .then(data => {
+                    menuData = data;
+                    // Автоматически активируем первую стадию, в которой есть файлы
+                    const firstAvailableStage = Object.keys(data)[0];
+                    if (firstAvailableStage) {
+                        filterStage(firstAvailableStage);
+                    }
+                })
+                .catch(err => console.error("Ошибка загрузки меню:", err));
+        });
+
+        // 2. Логика клика по стадиям в SVG
+        function filterStage(stageName) {
+            // 1. Подсвечиваем активный блок в SVG (работает и для стадий, и для цилиндра БД)
+            document.querySelectorAll('.etl-node').forEach(node => node.classList.remove('active'));
+            const activeNode = document.getElementById(`node-${stageName}`);
+            if (activeNode) activeNode.classList.add('active');
+
+            // 2. Очищаем контейнер списка файлов в левом меню
+            const listContainer = document.getElementById('file-list');
+            listContainer.innerHTML = '';
+
+            // 3. Логика разделения: БД или обычная стадия
+            if (stageName === 'source-db') {
+                // Если выбрана БД — просто меняем заголовок, список файлов оставляем пустым
+                document.getElementById('sidebar-title').innerText = `Источник: MySQL`;
+                return;
+            }
+
+            // Если выбрана обычная стадия ETL — выводим её файлы
+            document.getElementById('sidebar-title').innerText = `Стадия: ${stageName.toUpperCase()}`;
+            const files = menuData[stageName] || [];
+
+            if (files.length === 0) {
+                listContainer.innerHTML = '<li class="file-item" style="color: #64748b; cursor: default;">Нет файлов для этой стадии</li>';
+                return;
+            }
+
+            files.forEach(fileName => {
+                const li = document.createElement('li');
+                li.className = 'file-item';
+                li.innerText = fileName;
+                li.onclick = function() {
+                    document.querySelectorAll('.file-item').forEach(item => item.classList.remove('active'));
+                    this.classList.add('active');
+                    loadFileView(fileName);
+                };
+                listContainer.appendChild(li);
+            });
+        }
+
+        // 3. Загрузка контента выбранного файла во фрейм / контейнер
+        function loadFileView(fileName) {
+            const viewer = document.getElementById('viewer');
+            viewer.innerHTML = '<div class="placeholder">Загрузка данных...</div>';
+
+            fetch(`/view?file=${encodeURIComponent(fileName)}`)
+                .then(response => response.text())
+                .then(htmlChunk => {
+                    viewer.innerHTML = htmlChunk;
+                })
+                .catch(err => {
+                    viewer.innerHTML = `<div class="placeholder" style="color: #ef4444;">Ошибка загрузки файла: ${err}</div>`;
+                });
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+{% if rows %}
+    <div class="table-container border rounded shadow-sm">
+        <table class="table table-striped table-hover table-bordered table-sm table-custom">
+            <tbody>
+                {% for row in rows %}
+                    <tr>
+                        <!-- Если строка является списком или кортежем, итерируемся по элементам -->
+                        {% if row is iterable and row is not string %}
+                            {% for value in row %}
+                                <td title="{{ value if value is not none else 'null' }}">
+                                    {% if value is none %}
+                                        <span class="text-danger-emphasis bg-danger-subtle px-1 rounded small">null</span>
+                                    {% else %}
+                                        {{ value }}
+                                    {% endif %}
+                                </td>
+                            {% endfor %}
+                        {% else %}
+                            <!-- Если строка оказалась одиночным значением -->
+                            <td title="{{ row }}">{{ row }}</td>
+                        {% endif %}
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+{% else %}
+    <div class="text-center text-muted my-5">
+        <h3>Файл пуст или содержит несовместимую структуру данных</h3>
+    </div>
+{% endif %}

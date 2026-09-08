@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parquet Viewer</title>
+    <!-- Подключаем Bootstrap 5 для красивого интерфейса -->
+    <link href="{{ url_for('static', path='bootstrap.min.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', path='style.css') }}" rel="stylesheet">
+</head>
+<body>
+
+<div class="d-flex text-nowrap align-items-stretch" style="min-height: 100vh;">
+
+    <!-- 1. ЛЕВАЯ ПАНЕЛЬ: Сайдбар (Ширина зафиксирована в style.css) -->
+    <div class="sidebar p-3 flex-shrink-0">
+        <h5 class="mb-3 text-wrap">📁 Файлы данных (ETL)</h5>
+        <div id="menu-container" class="list-group">
+            <div class="text-muted small p-2">Загрузка меню...</div>
+        </div>
+    </div>
+
+    <!-- 2. ПРАВАЯ ПАНЕЛЬ: Контентная зона (Занимает все оставшееся место) -->
+    <div class="flex-grow-1 p-4 overflow-hidden" style="background-color: #fdfdfd;">
+        <h2>Просмотр данных ETL</h2>
+
+        <!-- Контейнер для таблицы -->
+        <div id="table-wrapper" class="mt-4">
+            <div class="text-center text-muted my-5">
+                <h3>Выбери файл из списка слева, чтобы просмотреть его содержимое</h3>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+  const STAGE_TITLES = {
+        'extracted': '📥 1. Extracted (Сырые)',
+        'normalized': '🧹 2. Normalized',
+        'deduplicated': '✂️ 3. Deduplicated',
+        'checked': '✅ 4. Checked',
+        'joined': '🔗 5. Joined (Слияние)',
+        'loading_s3': '☁️ 6. Loading S3',
+        'loading_db': '🗄️ 7. Loading DB',
+        'other': '📦 Разное'
+    };
+
+    async function loadMenu() {
+        const menuContainer = document.getElementById('menu-container');
+
+        try {
+            const response = await fetch('/menu');
+            const structuredMenu = await response.json();
+
+            // Если бэкенд прислал пустой объект (нет файлов)
+            if (Object.keys(structuredMenu).length === 0) {
+                menuContainer.innerHTML = '<div class="alert alert-warning py-2 m-2">Папка пуста.</div>';
+                return;
+            }
+
+            // Очищаем лоадер перед отрисовкой
+            menuContainer.innerHTML = '';
+
+            // Итерируемся по каждой стадии в JSON
+            for (const [stage, files] of Object.entries(structuredMenu)) {
+                if (files.length === 0) continue; // Пропускаем пустые стадии
+
+                // 1. Создаем блок заголовка для текущей стадии
+                const sectionTitle = document.createElement('div');
+                sectionTitle.className = 'fw-bold text-uppercase text-secondary mt-3 mb-2 px-2 small';
+                sectionTitle.innerText = STAGE_TITLES[stage] || stage.toUpperCase();
+                menuContainer.appendChild(sectionTitle);
+
+                // 2. Отрисовываем файлы, принадлежащие этой стадии
+                files.forEach(fileName => {
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.className = 'list-group-item list-group-item-action etl-file-btn mb-1 rounded-1 shadow-sm';
+                    button.innerText = `📄 ${fileName}`;
+
+                    // Обработчик асинхронного клика по файлу для вывода таблицы
+                    button.addEventListener('click', async () => {
+                        // Подсвечиваем активный элемент
+                        document.querySelectorAll('#menu-container .etl-file-btn').forEach(b => b.classList.remove('active'));
+                        button.classList.add('active');
+
+                        const wrapper = document.getElementById('table-wrapper');
+
+                        // Лоадер во время ожидания чтения файла
+                        wrapper.innerHTML = `
+                            <div class="text-center my-5">
+                                <div class="spinner-border text-primary" role="status"></div>
+                                <p class="mt-2 text-muted">Чтение файла ${fileName}...</p>
+                            </div>
+                        `;
+
+                        try {
+                            const res = await fetch(`/view?file=${encodeURIComponent(fileName)}`);
+                            if (!res.ok) throw new Error('Не удалось загрузить данные с сервера');
+
+                            const tableHtml = await res.text();
+                            wrapper.innerHTML = tableHtml;
+                        } catch (err) {
+                            wrapper.innerHTML = `<div class="alert alert-danger">⚠️ ${err.message}</div>`;
+                        }
+                    });
+
+                    menuContainer.appendChild(button);
+                });
+            }
+
+        } catch (err) {
+            menuContainer.innerHTML = '<div class="alert alert-danger py-2 m-2">Ошибка загрузки меню</div>';
+            console.error(err);
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', loadMenu);
+</script>
+
+</body>
+</html>
