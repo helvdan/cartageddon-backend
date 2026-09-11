@@ -1,156 +1,306 @@
 import logging
-import pickle
-from pathlib import Path
-
-import polars as pl
-from fastapi import FastAPI, Request, APIRouter, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-
 import os
+import pickle
 import sys
 from pathlib import Path
+from typing import Optional
 
-# 1. Путь к общей папке проекта (~/zoovostorg/)
+import anyio
+import polars as pl
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, status, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from watchfiles import awatch  # Встроено в uvicorn[standard]
+
+# 1. Путь к общей папке проекта
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-# 2. Путь к самой папке соседа (~/zoovostorg/cartageddon/)
+# 2. Путь к самой папке соседа
 cartageddon_dir = root_dir / "cartageddon"
 sys.path.append(str(cartageddon_dir))
 
 
+from utils import get_context_list, get_runtime_context
+
 from cartageddon.pipeline import Pipeline
-from cartageddon.common import RunTimeContext
+
+
+log_file = Path("/logs/app.log")
+
+logging.basicConfig(level=logging.DEBUG)
+
+pipeline_formatter = logging.Formatter("%(asctime)s [%(name)s] [%(levelname)s] %(message)s")
+file_handler = logging.FileHandler(log_file, encoding="utf-8")
+file_handler.setFormatter(pipeline_formatter)
+file_handler.setLevel(logging.DEBUG)
+
+WHITELISTED_LOGGERS = ("PIPELINE", "ARTIFACT", "EXTRACT", "DEDUP", "JOIN", "INTEGRITY", "LOAD_S3", "LOAD_DB")
+
+for logger_name in WHITELISTED_LOGGERS:
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    if not logger.handlers:
+        logger.addHandler(file_handler)
 
 
 app = FastAPI(title="Parquet Viewer")
 
-# Подставляем ваш актуальный путь к папке с результатами ETL
-DATA_DIR = Path("/tmp/cartageddon/").resolve()
-TEMPLATES_DIR = Path("./templates").resolve()
+app.state.current_context = "sample"
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,            # Разрешаем запросы с нашего React-сайта
+    allow_credentials=True,
+    allow_methods=["*"],              # Разрешаем все методы: GET, POST, PUT, DELETE
+    allow_headers=["*"],              # Разрешаем любые заголовки
+)
 
-
-def get_structured_menu():
-    """
-    Сканирует папку и распределяет файлы по ETL-стадиям.
-    Возвращает словарь, где ключи — это стадии в строгом порядке.
-    """
-    # 1. Задаем строгий порядок стадий
-    stages = ["extracted", "normalized", "deduplicated", "checked", "joined", "loading_s3", "loading_db"]
-
-    # Инициализируем пустую структуру меню
-    menu = {stage: [] for stage in stages}
-    menu["other"] = []  # Для файлов, которые не подошли ни под одну стадию
-
-    # 2. Сканируем директорию (берем и parquet, и pkl)
-    extensions = ("*.parquet", "*.pkl")
-    all_files = []
-    for ext in extensions:
-        all_files.extend(DATA_DIR.glob(ext))
-
-    # Сортируем все файлы по алфавиту для красоты
-    all_files = sorted(all_files, key=lambda f: f.name)
-
-    # 3. Распределяем файлы по бакетам на основе их имен
-    for file_path in all_files:
-        name_lower = file_path.name.lower()
-        matched = False
-
-        for stage in stages:
-            # Ищем маркер стадии в имени файла (например, '.extracted.')
-            if f".{stage}." in name_lower or name_lower.endswith(f".{stage}"):
-                menu[stage].append(file_path.name)
-                matched = True
-                break
-
-        if not matched:
-            menu["other"].append(file_path.name)
-
-    # Удаляем пустые стадии, чтобы не плодить пустые блоки в интерфейсе
-    return {stage: files for stage, files in menu.items() if files}
+STAGE_MAP = {}
+ORDERED_POSTFIXES = []
+for item in Pipeline.STAGES_ORDER:
+    if isinstance(item, tuple):
+        for sub_item in item:
+            if hasattr(sub_item, 'postfix'):
+                ORDERED_POSTFIXES.append(sub_item.postfix)
+                STAGE_MAP[sub_item.postfix] = item
+    else:
+        if hasattr(item, 'postfix'):
+            ORDERED_POSTFIXES.append(item.postfix)
+            STAGE_MAP[item.postfix] = item
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="index_schema.html",
-        context={}
+class ContextRequest(BaseModel):
+    preset: str  # Ожидает структуру {"context": "sample"}
+
+
+@app.get("/context", response_class=JSONResponse)
+def get_context(request: Request) -> JSONResponse:
+    available_contexts = {}
+
+    for context_name in get_context_list():
+        available_contexts[context_name] = context_name == request.app.state.current_context
+
+    return JSONResponse(
+        content={
+            "contexts": available_contexts
+        }
     )
 
 
-@app.get("/menu", response_class=JSONResponse)
-async def get_menu():
-    structured_data = get_structured_menu()
-    return JSONResponse(structured_data)
+# 2. Обновляем эндпоинт
+@app.post("/context/change/")
+def change_context(request_data: ContextRequest, request: Request):
+    context_type = request_data.preset.lower()
+
+    if context_type not in ["sample", "test"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid context type. Must be 'sample' or 'test'."
+        )
+
+    request.app.state.current_context = context_type
+
+    return {"success": True, "current_context": context_type}
 
 
-@app.get("/view", response_class=HTMLResponse)
+def _parse_parquet(file_path):
+    df = pl.read_parquet(file_path, n_rows=100)
+    headers = [[str(name), str(dtype)] for name, dtype in df.schema.items()]
+    rows = df.rows()
+    return headers, rows
+
+
+def _parse_pickle(file_path):
+    with open(file_path, "rb") as f:
+        pickle_data = pickle.load(f)
+
+    rows = pickle_data[:100]
+    return [], rows
+
+
+def _get_stage_files(stage_name: str, data_dir: str) -> list:
+    """Вспомогательная функция сбора файлов для конкретной стадии"""
+    # Ищем файлы, которые содержат постфикс стадии (например, *.extracted.*)
+    data_dir = Path(data_dir).resolve()
+    all_files = data_dir.glob(f"*.{stage_name}.*")
+    # Возвращаем только имена файлов, отсортированные по алфавиту
+    return sorted([f.name for f in all_files])
+
+
+@app.websocket("/ws/artifacts/{stage_name}")
+async def websocket_artifacts_endpoint(websocket: WebSocket, stage_name: str):
+    context = websocket.app.state.current_context
+    ctx = get_runtime_context(context)
+
+    await websocket.accept()
+    try:
+        # 1. Сразу при подключении отправляем текущее состояние папки
+        await websocket.send_json(_get_stage_files(stage_name, ctx.work_dir))
+
+        # 2. Запускаем асинхронную слежку за директорией
+        async for changes in awatch(ctx.work_dir):
+            # Как только watchfiles заметил изменения (создание, удаление, изменение файлов)
+            # отправляем свежий отфильтрованный список на фронтенд
+            await websocket.send_json(_get_stage_files(stage_name, ctx.work_dir))
+
+    except WebSocketDisconnect:
+        print(f"[WS Artifacts] Отключился клиент для стадии: {stage_name}")
+    except Exception as e:
+        print(f"[WS Artifacts] Ошибка: {e}")
+
+
+@app.websocket("/ws/logs")
+async def websocket_logs_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        # Открываем файл в асинхронном режиме чтения
+        async with await anyio.open_file(log_file, mode="r") as f:
+            # Сначала сдвигаем указатель в конец файла,
+            # чтобы читать только новые логи (или уберите seek, если нужны старые тоже)
+            await f.seek(0, 2)
+
+            while True:
+                line = await f.readline()
+                if not line:
+                    # Если новых строк нет, делаем микро-паузу, чтобы не вешать процессор
+                    await anyio.sleep(0.1)
+                    continue
+
+                # Отправляем строчку на фронтенд (убираем лишние переносы \n)
+                await websocket.send_text(line.strip())
+
+    except WebSocketDisconnect:
+        print("[WS] Клиент отключился от логов")
+    except Exception as e:
+        print(f"[WS] Ошибка стриминга логов: {e}")
+
+
+@app.get("/artifacts/{file}", response_class=JSONResponse)
 async def view_file(request: Request, file: str):
-    headers = None
-    rows = None
-    error_message = None
+    ctx = get_runtime_context(request.app.state.current_context)
+    file_path = (Path(ctx.work_dir) / file).resolve()
 
-    # Безопасно собираем и проверяем путь к файлу
-    file_path = (DATA_DIR / file).resolve()
-    print(file_path)
+    headers = []
+    rows = []
+    if file_path.suffix.lower() == ".parquet":
+        headers, rows = _parse_parquet(file_path)
+    elif file_path.suffix.lower() == ".pkl":
+        headers, rows = _parse_pickle(file_path)
 
-    if not str(file_path).startswith(str(DATA_DIR)):
-        error_message = "Доступ к файлу запрещен."
-    elif not file_path.exists():
-        error_message = f"Файл {file} не найден."
-    elif file_path.suffix.lower() not in [".parquet", ".pkl"]:
-        error_message = "Неподдерживаемый формат файла. Разрешены только .parquet и .pkl"
-    else:
-        try:
-            df = None
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "headers": headers,
+                "rows": rows
+            }
+        )
+    )
 
-            # Чтение PARQUET
-            if file_path.suffix.lower() == ".parquet":
-                df = pl.read_parquet(file_path, n_rows=100)
 
-            # Чтение PICKLE
-            elif file_path.suffix.lower() == ".pkl":
-                with open(file_path, "rb") as f:
-                    pickle_data = pickle.load(f)
+@app.delete("/artifacts/{file}", response_class=JSONResponse)
+async def delete_file(request: Request, file: str):
+    ctx = get_runtime_context(request.app.state.current_context)
+    file_path = (Path(ctx.work_dir) / file).resolve()
+    os.remove(file_path)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"success": True, "message": f"Файл {file} успешно удален."}
+    )
 
-                raw_rows = pickle_data[:100]
 
-                # Рендерим ОСОБЫЙ шаблон для сырых pickle-данных
-                return templates.TemplateResponse(
-                    request=request,
-                    name="table_pickle.html",
-                    context={
-                        "rows": raw_rows
-                    }
-                )
+@app.post("/pipeline/run", response_class=JSONResponse)
+@app.post("/pipeline/run/{stage_name}/{artifact}", response_class=JSONResponse)
+def run_pipeline(
+    request: Request,
+    stage_name: Optional[str] = None,
+    artifact: Optional[str] = None,
+):
+    logger = logging.getLogger("PIPELINE")
+    logger.debug("Это сообщение запишется в файл")
 
-            if df is not None:
-                # df = fix_cyrillic(df)
-                # Готовим заголовки и строки для шаблона table.html
-                headers = [(name, str(dtype)) for name, dtype in df.schema.items()]
-                rows = df.rows()
-            else:
-                error_message = "Файл пуст или его структура не поддерживается."
+    oc_table_names = None
+    active_stage_names = None
 
-        except Exception as e:
-            error_message = f"Ошибка при чтении файла: {str(e)}"
+    if artifact:
+        oc_table_name = artifact.split(".")[0]
+        oc_table_names = {oc_table_name}
 
-    # Возвращаем исключительно фрагмент table.html с нужным контекстом
-    return templates.TemplateResponse(
-        request=request,
-        name="table.html",
-        context={
-            "headers": headers,
-            "rows": rows,
-            "error_message": error_message
-        }
+    if stage_name:
+        i = ORDERED_POSTFIXES.index(stage_name)
+        active_stage_names = set()
+        for stage_postfix in ORDERED_POSTFIXES[:i + 1]:
+            active_stage_names.add(STAGE_MAP[stage_postfix].name)
+
+    try:
+        ctx = get_runtime_context(request.app.state.current_context)
+        pipeline = Pipeline(ctx, run_default_hooks=False)
+        pipeline.execute(
+            oc_table_names=oc_table_names,
+            active_stage_names=active_stage_names
+        )
+    except Exception as e:
+        return JSONResponse(
+            {
+                "error": str(e)
+            },
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    return JSONResponse(
+        {"success": True},
+        status_code=status.HTTP_200_OK
+    )
+
+
+@app.get("/artifacts/{file}/previous", response_class=JSONResponse)
+async def get_table_history(file: str):
+    oc_table_name = file.split(".")[0]
+    all_files = list(DATA_DIR.glob(f"{oc_table_name}.*"))
+
+    def get_stage_index(filename: str) -> int:
+        """Вспомогательная функция для определения веса стадии при сортировке"""
+        # Разбиваем имя (например, oc_product.extracted.pkl) и ищем совпадение с ORDERED_POSTFIXES
+        parts = filename.split(".")
+        for postfix in ORDERED_POSTFIXES:
+            if postfix in parts:
+                return ORDERED_POSTFIXES.index(postfix)
+        return float('inf') # Если стадия неизвестна, убираем её в самый конец
+
+    # 2. Сортируем все найденные файлы согласно нашему ORDERED_POSTFIXES
+    all_files.sort(key=lambda x: get_stage_index(x.name))
+
+    data = []
+    for artifact in all_files:
+        # Пропускаем текущий файл, так как нам нужны только *предыдущие*
+        if artifact.name == file:
+            continue
+
+        headers = []
+        rows = []
+        if artifact.name.endswith('.pkl'):
+            headers, rows = _parse_pickle(artifact)
+        elif artifact.name.endswith('.parquet'):
+            headers, rows = _parse_parquet(artifact)
+
+        data.append({
+            "artifact": artifact.name,
+            "data": {
+                "headers": headers,
+                "rows": rows
+            }
+        })
+
+    return JSONResponse(
+        content=jsonable_encoder(data)
     )
 
 
@@ -172,113 +322,22 @@ STAGE_ORDER = ["EXTRACT", "NORMALIZE", "DEDUP", "INTEGRITY", "JOIN", "LOAD"]
 
 
 class StageController:
-    @staticmethod
-    @router.delete("/{stage_name}/")
-    async def delete_stage_files(stage_name: str):
-        print(stage_name)
-        allowed_stages = ["extracted", "normalized", "deduplicated", "checked", "joined"]
-        if stage_name not in allowed_stages:
-            raise HTTPException(status_code=400, detail=f"Стадию '{stage_name}' нельзя удалить.")
-
-        structured_menu = get_structured_menu()
-        print('******************')
-        print(structured_menu)
-        print('******************')
-        files_to_delete = structured_menu.get(stage_name, [])
-
-        if not files_to_delete:
-            raise HTTPException(status_code=404, detail="Файлов для удаления не найдено.")
-
-        deleted_count = 0
-        for file_name in files_to_delete:
-            file_path = (DATA_DIR / file_name).resolve()
-            if str(file_path).startswith(str(DATA_DIR)) and file_path.exists():
-                file_path.unlink()
-                deleted_count += 1
-
-        return {"status": "success", "message": f"Удалено файлов: {deleted_count}"}
 
     @staticmethod
-    @router.put("/{stage_name}/")
-    async def run_pipeline_from_stage(stage_name: str):
-        if stage_name == "source-db":
-            active_stages = None
-            target_stage_internal = "SOURCE"
-        else:
-            if stage_name not in STAGE_MAPPING:
-                raise HTTPException(status_code=400, detail=f"Неизвестная стадия: {stage_name}")
+    @router.get("/{stage_name}/")
+    async def get_stage_files(stage_name: str):
+        extensions = ("*.parquet", "*.pkl")
+        all_files = []
+        for ext in extensions:
+            all_files.extend(DATA_DIR.glob(ext))
 
-            # 1. Логика отсечения: определяем, с какого момента запускать пайплайн
-            target_stage_internal = STAGE_MAPPING[stage_name]
-            try:
-                target_index = STAGE_ORDER.index(target_stage_internal)
-                # Берем целевую стадию и ВСЕ, что идет строго ПОСЛЕ нее
-                active_stages = set(STAGE_ORDER[target_index:])
-            except ValueError:
-                active_stages = {"NORMALIZE", "DEDUP", "INTEGRITY", "JOIN", "LOAD"}
+        stage_files = []
+        for file_path in all_files:
+            if stage_name == str(file_path).split('.')[-2]:
+                stage_files.append(file_path.name)
 
-        # 2. Инициализация логирования внутри PUT метода
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
-            force=True  # Перезапишет глобальный конфиг логов FastAPI на время выполнения таски
-        )
-        logger = logging.getLogger("FastAPI_ETL_Runner")
-        logger.info(f"Запуск ETL пайплайна. Активные стадии: {active_stages}")
-
-        try:
-            # 3. Конфигурация контекста из вашего запроса
-            ctx = RunTimeContext(
-                work_dir="/tmp/cartageddon",
-                single_language=True,
-                chunk_size=5000,
-                oc_user="opencart_user",
-                oc_password="opencart_password",
-                oc_host="localhost",
-                oc_port=3307,
-                oc_database="opencart_db",
-                pg_user="django_user",
-                pg_password="django_password",
-                pg_host="localhost",
-                pg_port=5438,
-                pg_database="django_db",
-                aws_access_key_id="minio_admin",
-                aws_secret_access_key="minio_strong_password",
-                aws_endpoint_url="http://localhost:9000",
-                aws_region_name="us-east-1",
-                aws_bucket_name="dev",
-                open_cart_image_dir="/home/lmakeev/zoovostorg/cartageddon/sample/data",
-                s3_max_workers=2
-            )
-
-            # 4. Сборка и исполнение пайплайна с динамическим набором стадий
-            pipeline = Pipeline(ctx, run_default_hooks=False)
-            pipeline.execute(
-                oc_table_names={
-                    'oc_product',
-                    'oc_product_description',
-                    'oc_review',
-                    'oc_manufacturer',
-                    'oc_stock_status',
-                    'oc_tax_class',
-                    'oc_length_class',
-                    'oc_weight_class'
-                },
-                active_stage_names=active_stages
-            )
-
-            return JSONResponse({
-                "status": "success",
-                "message": f"Пайплайн успешно выполнен начиная со стадии {target_stage_internal}.",
-                "executed_stages": list(active_stages)
-            })
-
-        except Exception as e:
-            logger.error(f"Ошибка при выполнении пайплайна: {str(e)}", exc_info=True)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Ошибка выполнения ETL: {str(e)}"
-            )
+        stage_files.sort()
+        return stage_files
 
 
 app.include_router(router)
@@ -287,4 +346,4 @@ app.include_router(router)
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, log_level="debug")
