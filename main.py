@@ -1,18 +1,5 @@
-import logging
-import os
-import pickle
 import sys
 from pathlib import Path
-from typing import Optional
-
-import anyio
-import polars as pl
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, status, Request
-from fastapi.encoders import jsonable_encoder
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from watchfiles import awatch  # Встроено в uvicorn[standard]
 
 # 1. Путь к общей папке проекта
 root_dir = Path(__file__).resolve().parent.parent
@@ -23,9 +10,26 @@ cartageddon_dir = root_dir / "cartageddon"
 sys.path.append(str(cartageddon_dir))
 
 
+import logging
+import os
+import pickle
+from typing import Optional
+
+from infra.api import router as infra_router
+import anyio
+import polars as pl
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, status, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from watchfiles import awatch  # Встроено в uvicorn[standard]
+
+
 from utils import get_context_list, get_runtime_context
 
 from cartageddon.pipeline import Pipeline
+from cartageddon.schema import OpenCartSchema
 
 
 log_file = Path("/logs/app.log")
@@ -49,7 +53,7 @@ for logger_name in WHITELISTED_LOGGERS:
 
 
 app = FastAPI(title="Parquet Viewer")
-
+app.include_router(infra_router)
 app.state.current_context = "sample"
 
 origins = [
@@ -102,7 +106,7 @@ def get_context(request: Request) -> JSONResponse:
 def change_context(request_data: ContextRequest, request: Request):
     context_type = request_data.preset.lower()
 
-    if context_type not in ["sample", "test"]:
+    if context_type not in get_context_list():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid context type. Must be 'sample' or 'test'."
@@ -243,7 +247,9 @@ def run_pipeline(
 
     try:
         ctx = get_runtime_context(request.app.state.current_context)
-        pipeline = Pipeline(ctx, run_default_hooks=False)
+        pipeline = Pipeline(
+            OpenCartSchema(single_language=True), ctx, run_default_hooks=False
+        )
         pipeline.execute(
             oc_table_names=oc_table_names,
             active_stage_names=active_stage_names
