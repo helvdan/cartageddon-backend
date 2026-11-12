@@ -7,3 +7,4 @@ pyyaml==6.0.3
 SQLAlchemy==2.0.38
 asyncpg==0.31.0
 httpx==0.28.1
+boto3==1.36.0

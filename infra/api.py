@@ -2,19 +2,14 @@ import asyncio
 
 from fastapi import Depends, HTTPException, status, APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import exists, select, table, text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from cartageddon.common import RunTimeContext
 from cartageddon.schema import OpenCartSchema
 from utils import get_runtime_context
-
-# 1. Настройка подключения к PostgreSQL (замените на свои данные)
-DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/dbname"
-
-engine = create_async_engine(DATABASE_URL, echo=True)
-async_session = async_sessionmaker(engine, expire_on_commit=False)
+from infra.s3 import clear_s3_objects, get_s3_state
 
 router = APIRouter(
     prefix="/infra",
@@ -22,11 +17,23 @@ router = APIRouter(
 )
 
 
-POSTGRES_CHECK_EMPTY_SQL = text("""
-    SELECT COALESCE(SUM(n_live_tup), 0) 
-    FROM pg_stat_user_tables 
-    WHERE schemaname = 'public' AND relname = 'catalog_product';
-""")
+async def get_postgres_state(db: AsyncSession) -> str:
+    """Check actual ETL data, independently of PostgreSQL row-count estimates."""
+    result = await db.execute(text("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    """))
+    existing_tables = set(result.scalars())
+    target_tables = sorted(set(OpenCartSchema().get_pg_tables()) & existing_tables)
+
+    for table_name in target_tables:
+        query = select(exists().select_from(table(table_name, schema="public")))
+        result = await db.execute(query)
+        if result.scalar_one():
+            return "filled"
+
+    return "empty"
 
 
 async def create_dynamic_session(ctx: RunTimeContext):
@@ -145,6 +152,36 @@ async def truncate_tables(db: AsyncSession = Depends(get_db)):
         )
 
 
+@router.post("/s3/truncate")
+async def truncate_s3(request: Request):
+    try:
+        ctx = get_runtime_context(request.app.state.current_context)
+        deleted = await asyncio.to_thread(clear_s3_objects, ctx)
+        return {"deleted_objects": deleted}
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Не удалось очистить бакет S3. Проверьте доступность хранилища и права доступа.",
+        ) from err
+
+
+@router.websocket("/s3/ws/health")
+async def watch_s3_health(websocket: WebSocket):
+    await websocket.accept()
+    context_name = websocket.app.state.current_context
+    try:
+        while True:
+            try:
+                ctx = get_runtime_context(context_name)
+                state = await asyncio.to_thread(get_s3_state, ctx)
+            except Exception:
+                state = "disconnected"
+            await websocket.send_json({"state": state})
+            await asyncio.sleep(3)
+    except WebSocketDisconnect:
+        pass
+
+
 @router.websocket("/postgres/ws/health")
 async def watch_postgres_health(websocket: WebSocket):
     await websocket.accept()
@@ -155,9 +192,7 @@ async def watch_postgres_health(websocket: WebSocket):
             state_response = {}
             try:
                 async for db in create_dynamic_session(ctx):
-                    result = await db.execute(POSTGRES_CHECK_EMPTY_SQL)
-                    total_rows = result.scalar()
-                    state_response = {"state": "empty" if total_rows == 0 else "filled"}
+                    state_response = {"state": await get_postgres_state(db)}
 
             except (OSError, Exception) as err:
                 err_msg = str(err).lower()
