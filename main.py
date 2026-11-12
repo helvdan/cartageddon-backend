@@ -27,6 +27,7 @@ from watchfiles import awatch  # Встроено в uvicorn[standard]
 
 
 from utils import get_context_list, get_runtime_context
+from pipeline_api import create_pipeline_router
 
 from cartageddon.pipeline import Pipeline
 from cartageddon.schema import OpenCartSchema
@@ -41,7 +42,17 @@ file_handler = logging.FileHandler(log_file, encoding="utf-8")
 file_handler.setFormatter(pipeline_formatter)
 file_handler.setLevel(logging.DEBUG)
 
-WHITELISTED_LOGGERS = ("PIPELINE", "ARTIFACT", "EXTRACT", "DEDUP", "JOIN", "INTEGRITY", "LOAD_S3", "LOAD_DB")
+WHITELISTED_LOGGERS = (
+    "PIPELINE",
+    "ARTIFACT",
+    "EXTRACT",
+    "DEDUP",
+    "REDUCE"
+    "JOIN",
+    "INTEGRITY",
+    "LOAD_S3",
+    "LOAD_DB"
+)
 
 for logger_name in WHITELISTED_LOGGERS:
     logger = logging.getLogger(logger_name)
@@ -54,6 +65,7 @@ for logger_name in WHITELISTED_LOGGERS:
 
 app = FastAPI(title="Parquet Viewer")
 app.include_router(infra_router)
+app.include_router(create_pipeline_router(Pipeline))
 app.state.current_context = "sample"
 
 origins = [
